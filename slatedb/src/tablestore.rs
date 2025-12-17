@@ -233,6 +233,35 @@ impl TableStore {
         }
     }
 
+    /// Write raw WAL block bytes directly to object storage.
+    pub(crate) async fn write_wal_block(
+        &self,
+        wal_id: u64,
+        data: Bytes,
+    ) -> Result<(), SlateDBError> {
+        let id = SsTableId::Wal(wal_id);
+        let object_store = self.object_stores.store_for(&id);
+        let path = self.path(&id);
+        object_store
+            .put_opts(&path, data.into(), PutOptions::from(PutMode::Create))
+            .await
+            .map_err(|e| match e {
+                object_store::Error::AlreadyExists { .. } => SlateDBError::Fenced,
+                _ => SlateDBError::from(e),
+            })?;
+        Ok(())
+    }
+
+    /// Read raw WAL block bytes from object storage.
+    pub(crate) async fn read_wal_block(&self, wal_id: u64) -> Result<Bytes, SlateDBError> {
+        let id = SsTableId::Wal(wal_id);
+        let object_store = self.object_stores.store_for(&id);
+        let path = self.path(&id);
+        let file = object_store.get(&path).await?;
+        let bytes = file.bytes().await?;
+        Ok(bytes)
+    }
+
     /// Delete an SSTable from the object store.
     pub(crate) async fn delete_sst(&self, id: &SsTableId) -> Result<(), SlateDBError> {
         let object_store = self.object_stores.store_for(id);
