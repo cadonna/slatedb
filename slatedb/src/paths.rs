@@ -49,7 +49,7 @@ impl PathResolver {
             match suffix_iter.next() {
                 Some(a) if a.as_ref() == WAL_PATH => suffix_iter
                     .next()
-                    .and_then(|s| s.as_ref().split('.').next().map(|s| s.parse::<u64>()))
+                    .and_then(|s    | s.as_ref().split('.').next().map(|s| s.parse::<u64>()))
                     .transpose()
                     .map(|r| r.map(SsTableId::Wal))
                     .map_err(|_| SlateDBError::InvalidDBState),
