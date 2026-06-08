@@ -3,7 +3,7 @@ use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions};
 use crate::db_cache_manager::{self, CacheTarget};
-use crate::db_state::SsTableId;
+use crate::db_state::{collect_touched_segments, SsTableId};
 use crate::db_stats::DbStats;
 use crate::db_status::{ClosedResultWriter, DbStatus, DbStatusManager};
 use crate::dispatcher::{MessageFactory, MessageHandler, MessageHandlerExecutor};
@@ -11,10 +11,11 @@ use crate::error::SlateDBError;
 use crate::iter::IterationOrder;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
-use crate::mem_table::{ImmutableMemtable, KVTable};
+use crate::mem_table::{ImmutableMemtable, KVTable, WritableKVTable};
 use crate::merge_operator::MergeOperatorType;
 use crate::oracle::DbReaderOracle;
 use crate::paths::PathResolver;
+use crate::prefix_extractor::PrefixExtractor;
 use crate::rand::DbRand;
 use crate::reader::{DbStateReader, Reader, ScanContext};
 use crate::sst_iter::SstIteratorOptions;
@@ -33,7 +34,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use parking_lot::RwLock;
 use slatedb_common::clock::SystemClock;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ops::{RangeBounds, Sub};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -60,6 +61,7 @@ struct DbReaderInner {
     oracle: Arc<DbReaderOracle>,
     reader: Reader,
     status_manager: DbStatusManager,
+    segment_extractor: Option<Arc<dyn PrefixExtractor>>,
     rand: Arc<DbRand>,
     /// Kept alive so the underlying `MetricsRecorder` is not dropped while
     /// metric handles in `DbStats` (and other stats structs) are still in use.
@@ -111,7 +113,7 @@ impl DbReaderInner {
         options: DbReaderOptions,
         checkpoint_id: Option<Uuid>,
         merge_operator: Option<MergeOperatorType>,
-        status_manager: DbStatusManager,
+        segment_extractor: Option<Arc<dyn PrefixExtractor>>,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
         recorder: slatedb_common::metrics::MetricsRecorderHelper,
@@ -127,6 +129,7 @@ impl DbReaderInner {
                 Arc::clone(&manifest_store),
                 Arc::clone(&table_store),
                 &options,
+                segment_extractor.as_ref(),
                 checkpoint,
                 replay_new_wals,
             )
@@ -143,8 +146,11 @@ impl DbReaderInner {
         let initial_durable_seq = initial_state
             .last_remote_persisted_seq
             .max(initial_state.core().last_l0_seq);
-        status_manager.report_durable_seq(initial_durable_seq);
-        status_manager.report_manifest(VersionedManifest::from(initial_state.as_ref()));
+        let status_manager = DbStatusManager::new_with_manifest(
+            initial_durable_seq,
+            VersionedManifest::from(initial_state.as_ref()),
+            segment_extractor.is_some(),
+        );
         let oracle = Arc::new(DbReaderOracle::new(
             initial_durable_seq,
             status_manager.clone(),
@@ -161,7 +167,7 @@ impl DbReaderInner {
             merge_operator,
         );
 
-        Ok(Self {
+        let inner = Self {
             manifest_store,
             table_store,
             options,
@@ -171,9 +177,14 @@ impl DbReaderInner {
             oracle,
             reader,
             status_manager,
+            segment_extractor,
             rand,
             recorder,
-        })
+        };
+        inner
+            .status_manager
+            .report_memtable_segments(collect_touched_segments(inner.state.read().as_ref()));
+        Ok(inner)
     }
 
     async fn get_or_create_checkpoint(
@@ -281,6 +292,8 @@ impl DbReaderInner {
         *write_guard = Arc::new(new_checkpoint_state);
         drop(write_guard);
         self.status_manager.report_manifest(versioned_manifest);
+        self.status_manager
+            .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
         Ok(())
     }
 
@@ -303,6 +316,7 @@ impl DbReaderInner {
                 current_checkpoint.core(),
                 &mut imm_memtable,
                 true,
+                self.segment_extractor.as_ref(),
             )
             .await?;
 
@@ -315,6 +329,9 @@ impl DbReaderInner {
                 last_wal_id,
                 last_remote_persisted_seq: last_committed_seq,
             });
+            drop(write_guard);
+            self.status_manager
+                .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
         }
         Ok(())
     }
@@ -323,6 +340,7 @@ impl DbReaderInner {
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
         options: &DbReaderOptions,
+        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
         checkpoint: Checkpoint,
         replay_new_wals: bool,
     ) -> Result<CheckpointState, SlateDBError> {
@@ -335,6 +353,7 @@ impl DbReaderInner {
             replay_new_wals,
             Arc::clone(&table_store),
             options,
+            segment_extractor,
         )
         .await
     }
@@ -378,6 +397,7 @@ impl DbReaderInner {
             !self.options.skip_wal_replay,
             Arc::clone(&self.table_store),
             &self.options,
+            self.segment_extractor.as_ref(),
         )
         .await
     }
@@ -389,6 +409,7 @@ impl DbReaderInner {
         replay_new_wals: bool,
         table_store: Arc<TableStore>,
         options: &DbReaderOptions,
+        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
     ) -> Result<CheckpointState, SlateDBError> {
         let (last_wal_id, last_committed_seq) = Self::replay_wal_into(
             Arc::clone(&table_store),
@@ -396,6 +417,7 @@ impl DbReaderInner {
             &manifest.core,
             &mut imm_memtable,
             replay_new_wals,
+            segment_extractor,
         )
         .await?;
 
@@ -458,6 +480,7 @@ impl DbReaderInner {
         core: &ManifestCore,
         into_tables: &mut VecDeque<Arc<ImmutableMemtable>>,
         replay_new_wals: bool,
+        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
     ) -> Result<(u64, u64), SlateDBError> {
         let sst_iter_options = SstIteratorOptions {
             max_fetch_tasks: 1,
@@ -518,6 +541,12 @@ impl DbReaderInner {
                 // out entries <= last_committed_seq when creating the replay iterator.
                 assert!(first_seq > last_committed_seq);
                 last_committed_seq = replayed_table.last_seq;
+                if let Some(extractor) = segment_extractor {
+                    Self::record_replayed_touched_segments(
+                        extractor.as_ref(),
+                        &replayed_table.table,
+                    )?;
+                }
                 let imm_memtable =
                     ImmutableMemtable::new(replayed_table.table, replayed_table.last_wal_id);
                 into_tables.push_front(Arc::new(imm_memtable));
@@ -525,6 +554,31 @@ impl DbReaderInner {
         }
 
         Ok((replay_after_wal_id, last_committed_seq))
+    }
+
+    /// Re-derive each replayed entry's segment prefix (RFC-0024) and record the
+    /// table's touched-segment set, mirroring the writer's replay path. Durable
+    /// WAL entries were validated when accepted, so the antichain check is not
+    /// re-run; an empty/absent prefix under the configured extractor remains a
+    /// hard error.
+    fn record_replayed_touched_segments(
+        extractor: &dyn PrefixExtractor,
+        table: &WritableKVTable,
+    ) -> Result<(), SlateDBError> {
+        let mut touched_segments: BTreeSet<Bytes> = BTreeSet::new();
+        let mut iter = table.table().iter();
+        while let Some(entry) = iter.next_sync() {
+            match extractor.prefix_len(&crate::PrefixTarget::Point(entry.key.clone())) {
+                Some(0) | None => {
+                    return Err(SlateDBError::EmptySegmentPrefix { key: entry.key });
+                }
+                Some(n) => {
+                    touched_segments.insert(entry.key.slice(0..n));
+                }
+            }
+        }
+        table.record_touched_segments(touched_segments);
+        Ok(())
     }
 
     /// Returns the latest database status.
@@ -714,6 +768,7 @@ impl DbReader {
         store_provider: &dyn StoreProvider,
         checkpoint_id: Option<Uuid>,
         merge_operator: Option<MergeOperatorType>,
+        segment_extractor: Option<Arc<dyn PrefixExtractor>>,
         options: DbReaderOptions,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
@@ -730,13 +785,10 @@ impl DbReader {
             return Err(SlateDBError::InvalidDBState);
         }
 
-        let status_manager = DbStatusManager::new_with_manifest(
-            manifest.db_state().last_l0_seq,
-            VersionedManifest::from_manifest(manifest.id(), manifest.manifest().clone()),
-            false,
-        );
-        let task_executor =
-            MessageHandlerExecutor::new(Arc::new(status_manager.clone()), system_clock.clone());
+        manifest
+            .db_state()
+            .validate_extractor_configuration(segment_extractor.as_deref())?;
+
         let inner = Arc::new(
             DbReaderInner::new(
                 manifest_store,
@@ -744,13 +796,17 @@ impl DbReader {
                 options,
                 checkpoint_id,
                 merge_operator,
-                status_manager,
-                system_clock,
+                segment_extractor,
+                system_clock.clone(),
                 rand,
                 recorder,
                 manifest,
             )
             .await?,
+        );
+        let task_executor = MessageHandlerExecutor::new(
+            Arc::new(inner.status_manager.clone()),
+            system_clock.clone(),
         );
 
         // If no checkpoint was provided, then we have established a new checkpoint
@@ -1199,8 +1255,8 @@ mod tests {
     use super::CheckpointState;
     use crate::clock::MonotonicClock;
     use crate::config::{
-        CheckpointOptions, CheckpointScope, FlushOptions, FlushType, MergeOptions, Settings,
-        WriteOptions,
+        CheckpointOptions, CheckpointScope, FlushOptions, FlushType, MergeOptions, PutOptions,
+        Settings, WriteOptions,
     };
     use crate::db_reader::{DbReader, DbReaderInner, DbReaderOptions};
     use crate::db_state::SsTableId;
@@ -1308,6 +1364,7 @@ mod tests {
             &test_provider,
             Some(checkpoint_result.id),
             None,
+            None,
             DbReaderOptions::default(),
             test_provider.system_clock.clone(),
             test_provider.rand.clone(),
@@ -1353,6 +1410,158 @@ mod tests {
             reader.get(key).await.unwrap(),
             Some(Bytes::from_static(checkpoint_value))
         );
+    }
+
+    #[tokio::test]
+    async fn should_report_memtable_segments_to_subscription() {
+        // given
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_reader_subscribe_reports_memtable_segments";
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(Settings::default())
+            .with_segment_extractor(Arc::new(test_utils::FixedThreeBytePrefixExtractor))
+            .build()
+            .await
+            .unwrap();
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
+        db.put_with_options(b"abc-1", b"v1", &PutOptions::default(), &write_opts)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+
+        // when
+        let reader = DbReader::builder(path, object_store.clone())
+            .with_segment_extractor(Arc::new(test_utils::FixedThreeBytePrefixExtractor))
+            .build()
+            .await
+            .unwrap();
+
+        // then
+        let prefixes: Vec<Bytes> = reader
+            .status()
+            .list_segments()
+            .unwrap()
+            .into_iter()
+            .map(|seg| seg.prefix)
+            .collect();
+        assert_eq!(prefixes, vec![Bytes::from_static(b"abc")]);
+    }
+
+    #[tokio::test]
+    async fn should_reject_reader_with_mismatched_extractor() {
+        #[derive(Debug)]
+        struct OtherExtractor;
+        impl crate::prefix_extractor::PrefixExtractor for OtherExtractor {
+            fn name(&self) -> &str {
+                "other"
+            }
+            fn prefix_len(&self, _target: &crate::prefix_extractor::PrefixTarget) -> Option<usize> {
+                Some(3)
+            }
+        }
+
+        // given
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_reader_rejects_mismatched_extractor";
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(Settings::default())
+            .with_segment_extractor(Arc::new(test_utils::FixedThreeBytePrefixExtractor))
+            .build()
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        // when
+        let err = match DbReader::builder(path, object_store.clone())
+            .with_segment_extractor(Arc::new(OtherExtractor))
+            .build()
+            .await
+        {
+            Ok(_) => panic!("expected mismatched-extractor error"),
+            Err(err) => err,
+        };
+
+        // then
+        assert_eq!(err.kind(), crate::ErrorKind::Invalid);
+
+        // when
+        // a segmented database also rejects a reader opened without any extractor
+        let err = match DbReader::builder(path, object_store).build().await {
+            Ok(_) => panic!("expected missing-extractor error"),
+            Err(err) => err,
+        };
+
+        // then
+        assert_eq!(err.kind(), crate::ErrorKind::Invalid);
+        let source = std::error::Error::source(&err)
+            .and_then(|s| s.downcast_ref::<crate::error::SlateDBError>());
+        assert!(matches!(
+            source,
+            Some(crate::error::SlateDBError::SegmentExtractorMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn should_list_checkpoint_segments_for_checkpoint_reader() {
+        // given
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_reader_lists_checkpoint_segments";
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(Settings::default())
+            .with_segment_extractor(Arc::new(test_utils::FixedThreeBytePrefixExtractor))
+            .build()
+            .await
+            .unwrap();
+        let write_opts = WriteOptions {
+            await_durable: false,
+            ..Default::default()
+        };
+        db.put_with_options(b"abc-1", b"v1", &PutOptions::default(), &write_opts)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        db.put_with_options(b"xyz-1", b"v2", &PutOptions::default(), &write_opts)
+            .await
+            .unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+
+        // when
+        let reader = DbReader::builder(path, object_store)
+            .with_segment_extractor(Arc::new(test_utils::FixedThreeBytePrefixExtractor))
+            .with_checkpoint_id(checkpoint.id)
+            .build()
+            .await
+            .unwrap();
+
+        // then
+        let segments: Vec<Bytes> = reader
+            .status()
+            .list_segments()
+            .unwrap()
+            .into_iter()
+            .map(|seg| seg.prefix)
+            .collect();
+        assert_eq!(segments, vec![Bytes::from_static(b"abc")]);
     }
 
     #[tokio::test]
@@ -1588,6 +1797,7 @@ mod tests {
             &core,
             &mut into_tables,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1652,6 +1862,7 @@ mod tests {
             &core,
             &mut into_tables,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1703,6 +1914,7 @@ mod tests {
             &core,
             &mut into_tables,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1738,6 +1950,7 @@ mod tests {
             &core,
             &mut into_tables,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -1768,6 +1981,7 @@ mod tests {
             &core,
             &mut into_tables,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -1813,6 +2027,7 @@ mod tests {
             &core,
             &mut into_tables,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -2085,6 +2300,7 @@ mod tests {
                 self,
                 checkpoint,
                 merge_operator,
+                None,
                 options,
                 self.system_clock.clone(),
                 self.rand.clone(),
@@ -2277,6 +2493,7 @@ mod tests {
             oracle,
             reader,
             status_manager: DbStatusManager::new(0),
+            segment_extractor: None,
             rand: test_provider.rand.clone(),
             recorder,
         };
@@ -2358,6 +2575,7 @@ mod tests {
             oracle,
             reader,
             status_manager: DbStatusManager::new(0),
+            segment_extractor: None,
             rand: test_provider.rand.clone(),
             recorder,
         }
