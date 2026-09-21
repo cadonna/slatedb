@@ -1,13 +1,3 @@
-use async_trait::async_trait;
-use bytes::Bytes;
-use log::error;
-use slatedb_common::metrics::CounterFn;
-use std::collections::VecDeque;
-use std::ops::Bound::{Excluded, Included, Unbounded};
-use std::ops::{Bound, Range, RangeBounds};
-use std::sync::Arc;
-use tokio::task::JoinHandle;
-
 use crate::block_iterator::DataBlockIterator;
 use crate::bytes_range::BytesRange;
 use crate::db_state::{SsTableId, SsTableView};
@@ -24,6 +14,16 @@ use crate::{
     types::RowEntry,
     utils::panic_string,
 };
+use async_trait::async_trait;
+use bytes::Bytes;
+use log::error;
+use slatedb_common::metrics::CounterFn;
+use std::collections::VecDeque;
+use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::ops::{Bound, Range, RangeBounds};
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+use tracing::instrument::WithSubscriber;
 
 enum FetchTask {
     InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
@@ -483,8 +483,8 @@ impl<'a> InternalSstIterator<'a> {
                     let read_trace = self.read_trace();
                     let sst_level = self.sst_level().cloned();
                     let blocks_end = blocks.end;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
+                    self.fetch_tasks.push_back(FetchTask::InFlight(tokio::spawn(
+                        async move {
                             table_store
                                 .read_blocks_using_index(
                                     &table,
@@ -496,7 +496,9 @@ impl<'a> InternalSstIterator<'a> {
                                     sst_level.as_ref(),
                                 )
                                 .await
-                        })));
+                        }
+                        .with_current_subscriber(),
+                    )));
                     self.next_block_idx_to_fetch = blocks_end;
                 }
             }
@@ -521,8 +523,8 @@ impl<'a> InternalSstIterator<'a> {
                     let read_trace = self.read_trace();
                     let sst_level = self.sst_level().cloned();
                     let blocks_start = blocks.start;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
+                    self.fetch_tasks.push_back(FetchTask::InFlight(tokio::spawn(
+                        async move {
                             table_store
                                 .read_blocks_using_index(
                                     &table,
@@ -534,7 +536,9 @@ impl<'a> InternalSstIterator<'a> {
                                     sst_level.as_ref(),
                                 )
                                 .await
-                        })));
+                        }
+                        .with_current_subscriber(),
+                    )));
                     self.next_block_idx_to_fetch = blocks_start;
                 }
             }
