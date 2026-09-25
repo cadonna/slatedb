@@ -1488,7 +1488,6 @@ mod tests {
     use crate::manifest::{LsmTreeState, Manifest, ManifestCore, Segment, VersionedManifest};
     use crate::merge_operator::{MergeOperator, MergeOperatorError};
     use crate::proptest_util::rng;
-    use crate::reader::ReadTrace;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
     use crate::tablestore::{TableStore, TableStoreKind};
     use crate::test_utils::{
@@ -1840,13 +1839,7 @@ mod tests {
 
         let (_, _, table_store) = build_test_stores(os);
         let index = table_store
-            .read_index(
-                &view.sst,
-                false,
-                Some(Bytes::new()),
-                &ReadTrace::none(),
-                None,
-            )
+            .read_index(&view.sst, false, Some(Bytes::new()))
             .await
             .unwrap();
         let block_metas = index.borrow().block_meta();

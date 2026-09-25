@@ -60,7 +60,6 @@ use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::sst::{BlockTransformer, SsTableFormat};
 use crate::iter::IterationOrder;
 use crate::partitioned_keyspace::{partition_point, RangePartitionedKeySpace};
-use crate::reader::ReadTrace;
 use crate::sst_stats::SstStats;
 use crate::tablestore::{TableStore, TableStoreKind};
 use crate::types::RowEntry;
@@ -264,13 +263,7 @@ impl SstFile {
     pub async fn index(&self) -> Result<SstIndex, crate::Error> {
         let inner = self
             .table_store
-            .read_index(
-                &self.handle,
-                true,
-                Some(Bytes::new()),
-                &ReadTrace::none(),
-                None,
-            )
+            .read_index(&self.handle, true, Some(Bytes::new()))
             .await?;
         Ok(SstIndex { inner })
     }
@@ -290,13 +283,7 @@ impl SstFile {
     pub async fn read_block(&self, block: usize) -> Result<Vec<RowEntry>, crate::Error> {
         let index = self
             .table_store
-            .read_index(
-                &self.handle,
-                true,
-                Some(Bytes::new()),
-                &ReadTrace::none(),
-                None,
-            )
+            .read_index(&self.handle, true, Some(Bytes::new()))
             .await?;
         let num_blocks = index.borrow().block_meta().len();
         if block >= num_blocks {
@@ -312,8 +299,6 @@ impl SstFile {
                 block..block + 1,
                 true,
                 Some(Bytes::new()),
-                &ReadTrace::none(),
-                None,
             )
             .await?;
         let block = blocks

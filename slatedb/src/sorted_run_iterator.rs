@@ -3,7 +3,7 @@ use crate::db_state::{SortedRun, SsTableView};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
-use crate::sst_iter::{SstIterator, SstIteratorOptions, SstTracingContext, SstView};
+use crate::sst_iter::{SstIterator, SstIteratorOptions, SstView};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
 use async_trait::async_trait;
@@ -55,7 +55,6 @@ impl<'a> SortedRunView<'a> {
         &mut self,
         table_store: Arc<TableStore>,
         sst_iterator_options: SstIteratorOptions,
-        sst_tracing_context: Option<SstTracingContext>,
         db_stats: Option<DbStats>,
     ) -> Result<Option<SstIterator<'a>>, SlateDBError> {
         let order = sst_iterator_options.order;
@@ -64,7 +63,6 @@ impl<'a> SortedRunView<'a> {
                 view,
                 table_store,
                 sst_iterator_options,
-                sst_tracing_context,
                 db_stats,
             )?)
         } else {
@@ -127,7 +125,6 @@ impl DescendingIteratorState {
 pub(crate) struct SortedRunIterator<'a> {
     table_store: Arc<TableStore>,
     sst_iter_options: SstIteratorOptions,
-    sst_tracing_context: Option<SstTracingContext>,
     db_stats: Option<DbStats>,
     view: SortedRunView<'a>,
     current_iter: Option<SstIterator<'a>>,
@@ -142,7 +139,6 @@ impl<'a> SortedRunIterator<'a> {
         view: SortedRunView<'a>,
         table_store: Arc<TableStore>,
         sst_iter_options: SstIteratorOptions,
-        sst_tracing_context: Option<SstTracingContext>,
         db_stats: Option<DbStats>,
     ) -> Result<Self, SlateDBError> {
         let descending_state = match sst_iter_options.order {
@@ -152,7 +148,6 @@ impl<'a> SortedRunIterator<'a> {
         let mut res = Self {
             table_store,
             sst_iter_options,
-            sst_tracing_context,
             db_stats,
             view,
             current_iter: None,
@@ -168,20 +163,12 @@ impl<'a> SortedRunIterator<'a> {
         sorted_run: SortedRun,
         table_store: Arc<TableStore>,
         sst_iter_options: SstIteratorOptions,
-        sst_tracing_context: Option<SstTracingContext>,
         db_stats: Option<DbStats>,
     ) -> Result<Self, SlateDBError> {
         let range = BytesRange::from(range);
         let tables = sorted_run.into_tables_covering_range(&range);
         let view = SortedRunView::Owned(tables, range);
-        SortedRunIterator::new(
-            view,
-            table_store,
-            sst_iter_options,
-            sst_tracing_context,
-            db_stats,
-        )
-        .await
+        SortedRunIterator::new(view, table_store, sst_iter_options, db_stats).await
     }
 
     #[allow(dead_code)]
@@ -197,7 +184,6 @@ impl<'a> SortedRunIterator<'a> {
             table_store,
             sst_iter_options,
             None,
-            None,
         )
         .await
     }
@@ -207,7 +193,6 @@ impl<'a> SortedRunIterator<'a> {
         sorted_run: SortedRun,
         table_store: Arc<TableStore>,
         sst_iter_options: SstIteratorOptions,
-        sst_tracing_context: Option<SstTracingContext>,
         db_stats: Option<DbStats>,
     ) -> Result<Self, SlateDBError> {
         let mut iter = SortedRunIterator::new_owned(
@@ -215,7 +200,6 @@ impl<'a> SortedRunIterator<'a> {
             sorted_run,
             table_store,
             sst_iter_options,
-            sst_tracing_context,
             db_stats,
         )
         .await?;
@@ -242,7 +226,7 @@ impl<'a> SortedRunIterator<'a> {
         let range = (range.start_bound().cloned(), range.end_bound().cloned());
         let tables = sorted_run.tables_covering_range(BytesRange::from_slice(range));
         let view = SortedRunView::Borrowed(tables, range);
-        SortedRunIterator::new(view, table_store, sst_iter_options, None, db_stats).await
+        SortedRunIterator::new(view, table_store, sst_iter_options, db_stats).await
     }
 
     #[cfg(test)]
@@ -265,7 +249,6 @@ impl<'a> SortedRunIterator<'a> {
             .build_next_iter(
                 self.table_store.clone(),
                 self.sst_iter_options.clone(),
-                self.sst_tracing_context.clone(),
                 self.db_stats.clone(),
             )
             .await?;

@@ -8,7 +8,6 @@ use crate::merge_iterator::MergeIterator;
 use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
-use crate::reader::ReadTrace;
 use crate::segment_iterator::{build_l0_point_iters, build_sr_point_iters, SegmentScanContext};
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
@@ -18,7 +17,6 @@ use futures::stream::{self, BoxStream, StreamExt};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
-use tracing::Instrument;
 
 /// [`DbIteratorRangeTracker`] records the *requested* scan range of a
 /// [`DbIterator`] so that the transaction manager can detect read-write
@@ -254,7 +252,6 @@ pub struct DbIterator {
     invalidated_error: Option<SlateDBError>,
     last_key: Option<Bytes>,
     order: IterationOrder,
-    read_span: tracing::Span,
 }
 
 impl DbIterator {
@@ -266,10 +263,7 @@ impl DbIterator {
         max_seq: Option<u64>,
         merge_operator: Option<MergeOperatorType>,
         order: IterationOrder,
-        read_trace: ReadTrace,
     ) -> Result<Self, SlateDBError> {
-        let read_span = read_trace.read_span();
-
         // The write_batch iterator is provided only when operating within a Transaction. It represents the uncommitted
         // writes made during the transaction. We do not need to apply the max_seq filter to them, because they do
         // not have an real committed sequence number yet.
@@ -315,14 +309,13 @@ impl DbIterator {
                 // The entries in the write batch iterator have seq num u64::MAX and any merges
                 // there need to be merged with the entries from the other iterators.
                 None,
-                read_trace,
             ));
         } else {
             // When no merge operator is configured, wrap with iterator that errors on merge operands
             iter = Box::new(MergeOperatorRequiredIterator::new(iter));
         }
 
-        iter.init().instrument(read_span.clone()).await?;
+        iter.init().await?;
 
         Ok(DbIterator {
             range,
@@ -330,7 +323,6 @@ impl DbIterator {
             invalidated_error: None,
             last_key: None,
             order,
-            read_span,
         })
     }
 
@@ -356,11 +348,6 @@ impl DbIterator {
     }
 
     pub(crate) async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        let read_span = self.read_span.clone();
-        self.next_entry_inner().instrument(read_span).await
-    }
-
-    async fn next_entry_inner(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         if let Some(error) = self.invalidated_error.clone() {
             Err(error)
         } else {
@@ -479,19 +466,14 @@ pub struct DbRecencyIterator {
     /// returns it instead of advancing, since after a failure the
     /// iterator's underlying state is unsafe to keep using.
     invalidated_error: Option<SlateDBError>,
-    read_span: tracing::Span,
 }
 
 impl DbRecencyIterator {
-    pub(crate) fn new(
-        iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
-        read_span: tracing::Span,
-    ) -> Self {
+    pub(crate) fn new(iters: VecDeque<Box<dyn RowEntryIterator + 'static>>) -> Self {
         Self {
             iters,
             current_initialized: false,
             invalidated_error: None,
-            read_span,
         }
     }
 
@@ -500,11 +482,6 @@ impl DbRecencyIterator {
     /// operands are not filtered. See [`crate::Db::scan_prefix_by_recency`]
     /// for the full contract.
     pub async fn next_entry(&mut self) -> Result<Option<RowEntry>, crate::Error> {
-        let read_span = self.read_span.clone();
-        self.next_entry_inner().instrument(read_span).await
-    }
-
-    async fn next_entry_inner(&mut self) -> Result<Option<RowEntry>, crate::Error> {
         if let Some(error) = &self.invalidated_error {
             return Err(error.clone().into());
         }
@@ -548,7 +525,6 @@ mod tests {
     use crate::error::SlateDBError;
     use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
     use crate::merge_operator::MergeOperatorType;
-    use crate::reader::ReadTrace;
     use crate::test_utils::{StringConcatMergeOperator, TestIterator};
     use crate::types::RowEntry;
     use async_trait::async_trait;
@@ -765,7 +741,6 @@ mod tests {
             Some(5),
             merge.then(|| Arc::new(StringConcatMergeOperator) as MergeOperatorType),
             order,
-            ReadTrace::none(),
         )
         .await
         .unwrap();
@@ -793,7 +768,6 @@ mod tests {
             None,
             None,
             IterationOrder::Ascending,
-            ReadTrace::none(),
         )
         .await
         .unwrap();
@@ -834,7 +808,6 @@ mod tests {
             Some(100),
             None,
             IterationOrder::Ascending,
-            ReadTrace::none(),
         )
         .await
         .unwrap();
@@ -865,7 +838,6 @@ mod tests {
             None,
             None,
             IterationOrder::Ascending,
-            ReadTrace::none(),
         )
         .await
         .unwrap();
@@ -915,7 +887,6 @@ mod tests {
             None,
             None,
             IterationOrder::Ascending,
-            ReadTrace::none(),
         )
         .await
         .unwrap();

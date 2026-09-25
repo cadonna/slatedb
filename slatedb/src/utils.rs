@@ -9,7 +9,6 @@ use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::manifest::ManifestCore;
 use crate::paths::PathResolver;
-use crate::reader::ReadTrace;
 use crate::tablestore::TableStore;
 use bytes::{Buf, BufMut, Bytes};
 use futures::FutureExt;
@@ -167,13 +166,7 @@ pub(crate) async fn last_written_key_and_seq(
     segment: &Bytes,
 ) -> Result<Option<(Bytes, u64)>, SlateDBError> {
     let index = table_store
-        .read_index(
-            output_sst,
-            false,
-            Some(segment.clone()),
-            &ReadTrace::none(),
-            None,
-        )
+        .read_index(output_sst, false, Some(segment.clone()))
         .await?;
     let num_blocks = index.borrow().block_meta().len();
     if num_blocks == 0 {
@@ -187,8 +180,6 @@ pub(crate) async fn last_written_key_and_seq(
             last_block_idx..last_block_idx + 1,
             false,
             Some(segment.clone()),
-            &ReadTrace::none(),
-            None,
         )
         .await?;
     let Some(block) = blocks.pop_front() else {
